@@ -1,5 +1,8 @@
 **/*
 !**/
 
+!/client.py
+!/rdt.py
+!/server.py
 !/LICENSE
 !/README.md
