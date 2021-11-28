@@ -1,6 +1,7 @@
 **/*
 !**/
 
+!/__main__.py
 !/client.py
 !/rdt.py
 !/server.py
