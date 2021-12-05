@@ -3,7 +3,7 @@ import os
 import random
 import socket
 import threading
-import time
+from struct import pack, unpack
 
 MAX_DATA_SIZE = 2 ** 15
 DELAY_RATE = 0.0
@@ -13,7 +13,12 @@ DUPLICATION_RATE = 0.0
 
 __rdt_stats = {
     'sent': 0,
-    'received': 0
+    'ack': 0,
+    'nak': 0,
+    'unknown': 0,
+    'received': 0,
+    'corrupt': 0,
+    'safe': 0
 }
 
 __udt_stats = {
@@ -55,37 +60,92 @@ def rdt_send(data: bytes, address: tuple[str, int] = None) -> int:
     elif len(data) > MAX_DATA_SIZE:
         raise OSError(errno.EMSGSIZE, os.strerror(errno.EMSGSIZE))
 
-    time.sleep(1e-6)  # throttling
+    send_pkt = __make_pkt(data)
 
-    pkt = __make_pkt(data)
+    while True:
+        size = __udt_send(send_pkt, address)
+        __rdt_stats['sent'] += 1
 
-    size = __udt_send(pkt, address)
-    __rdt_stats['sent'] += 1
+        recv_pkt, _ = __udt_recv()
+        _, flags = __extract(recv_pkt)
 
-    return size
+        if __is_ack(flags):
+            __rdt_stats['ack'] += 1
+
+            return size
+        elif __is_nak(flags):
+            __rdt_stats['nak'] += 1
+        else:  # FIXME: fatal flaw
+            __rdt_stats['unknown'] += 1
 
 
 def rdt_recv() -> [tuple[bytes, tuple[str, int]], bytes]:
     if not __RDT.init:
         raise OSError(errno.EDESTADDRREQ, os.strerror(errno.EDESTADDRREQ) + ': Call rdt_init')
 
-    pkt, address = __udt_recv()
-    __rdt_stats['received'] += 1
+    while True:
+        recv_pkt, address = __udt_recv()
+        __rdt_stats['received'] += 1
 
-    data = __extract(pkt)
+        if not __corrupt(recv_pkt):
+            send_pkt = __make_pkt(ack=True)
+            __udt_send(send_pkt, address)
 
-    if __RDT.bound:
-        return data, address
-    else:
-        return data
+            data, _ = __extract(recv_pkt)
+
+            __rdt_stats['safe'] += 1
+
+            if __RDT.bound:
+                return data, address
+            else:
+                return data
+        else:
+            __rdt_stats['corrupt'] += 1
+
+            send_pkt = __make_pkt(nak=True)
+            __udt_send(send_pkt, address)
 
 
-def __make_pkt(data: bytes) -> bytes:
-    return data
+def __make_pkt(data: bytes = b'', ack=False, nak=False) -> bytes:
+    flags = pack('!B', ack + (nak << 1))
+    checksum = pack('!H', __checksum(data))
+
+    return checksum + flags + data
 
 
-def __extract(pkt: bytes) -> bytes:
-    return pkt
+def __extract(pkt: bytes) -> [bytes, int]:
+    _, flags = unpack('!HB', pkt[:3])
+    data = pkt[3:]
+
+    return data, flags
+
+
+def __checksum(packet: bytes) -> int:
+    s = 0
+
+    if len(packet) % 2 == 1:
+        packet += b'\0'
+
+    for i in range(0, len(packet), 2):
+        c = s + int.from_bytes(packet[i:i + 2], 'big')
+        s = (c & 0xffff) + (c >> 16)
+
+    return ~s & 0xffff
+
+
+def __corrupt(pkt: bytes) -> bool:
+    expected_checksum = int.from_bytes(pkt[:2], 'big')
+    checksum = __checksum(pkt[3:])
+
+    return checksum != expected_checksum
+
+
+def __is_ack(flags: int) -> bool:
+    return bool(flags & 0x01)
+
+
+def __is_nak(flags: int) -> bool:
+    return bool(flags & 0x02)
 
 
 def rdt_stats(pprint=False):
@@ -95,9 +155,22 @@ def rdt_stats(pprint=False):
             'udt': __udt_stats
         }
 
+    recv_p = (100 / __rdt_stats['received']) if __rdt_stats['received'] > 0 else 0
+    sent_p = (100 / __rdt_stats['sent']) if __rdt_stats['sent'] > 0 else 0
+
     print('\nRDT stats:')
     print(f"* Received {__rdt_stats['received']} packets")
+
+    if __rdt_stats['received'] > 0:
+        print(f"  {__rdt_stats['safe']:6d} ({__rdt_stats['safe'] * recv_p:7.3f}%) safe packets")
+        print(f"  {__rdt_stats['corrupt']:6d} ({__rdt_stats['corrupt'] * recv_p:7.3f}%) corrupt packets")
+
     print(f"* Sent {__rdt_stats['sent']} packets")
+
+    if __rdt_stats['sent'] > 0:
+        print(f"  {__rdt_stats['ack']:6d} ({__rdt_stats['ack'] * sent_p:7.3f}%) ACK packets received")
+        print(f"  {__rdt_stats['nak']:6d} ({__rdt_stats['nak'] * sent_p:7.3f}%) NAK packets received")
+        print(f"  {__rdt_stats['unknown']:6d} ({__rdt_stats['unknown'] * sent_p:7.3f}%) unknown packets received")
 
     udt_p = (100 / __udt_stats['sent']) if __udt_stats['sent'] > 0 else 0
 
