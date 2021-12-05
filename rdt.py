@@ -15,9 +15,12 @@ __rdt_stats = {
     'sent': 0,
     'ack': 0,
     'nak': 0,
-    'unknown': 0,
+    'send_corrupt': 0,
+    'send_unknown': 0,
     'received': 0,
     'corrupt': 0,
+    'duplicated': 0,
+    'unknown': 0,
     'safe': 0
 }
 
@@ -37,6 +40,8 @@ class __RDT:
     bound = False
     simulate_unreliability = False
     init = False
+    send_seq_num = 0
+    recv_seq_num = 0
 
 
 def rdt_init(address: tuple[str, int], bind=False, simulate_unreliability=False) -> None:
@@ -60,7 +65,7 @@ def rdt_send(data: bytes, address: tuple[str, int] = None) -> int:
     elif len(data) > MAX_DATA_SIZE:
         raise OSError(errno.EMSGSIZE, os.strerror(errno.EMSGSIZE))
 
-    send_pkt = __make_pkt(data)
+    send_pkt = __make_pkt(data, __RDT.send_seq_num)
 
     while True:
         size = __udt_send(send_pkt, address)
@@ -69,14 +74,19 @@ def rdt_send(data: bytes, address: tuple[str, int] = None) -> int:
         recv_pkt, _ = __udt_recv()
         _, flags = __extract(recv_pkt)
 
-        if __is_ack(flags):
-            __rdt_stats['ack'] += 1
+        if not __corrupt(recv_pkt):
+            if __is_ack(flags):
+                __rdt_stats['ack'] += 1
 
-            return size
-        elif __is_nak(flags):
-            __rdt_stats['nak'] += 1
-        else:  # FIXME: fatal flaw
-            __rdt_stats['unknown'] += 1
+                __RDT.send_seq_num ^= 1
+
+                return size
+            elif __is_nak(flags):
+                __rdt_stats['nak'] += 1
+            else:  # shouldn't happen
+                __rdt_stats['send_unknown'] += 1
+        else:
+            __rdt_stats['send_corrupt'] += 1
 
 
 def rdt_recv() -> [tuple[bytes, tuple[str, int]], bytes]:
@@ -91,14 +101,21 @@ def rdt_recv() -> [tuple[bytes, tuple[str, int]], bytes]:
             send_pkt = __make_pkt(ack=True)
             __udt_send(send_pkt, address)
 
-            data, _ = __extract(recv_pkt)
+            data, flags = __extract(recv_pkt)
 
-            __rdt_stats['safe'] += 1
+            if __has_seq(flags, __RDT.recv_seq_num):
+                __rdt_stats['safe'] += 1
 
-            if __RDT.bound:
-                return data, address
-            else:
-                return data
+                __RDT.recv_seq_num ^= 1
+
+                if __RDT.bound:
+                    return data, address
+                else:
+                    return data
+            elif __has_seq(flags, __RDT.recv_seq_num ^ 1):
+                __rdt_stats['duplicated'] += 1
+            else:  # shouldn't happen
+                __rdt_stats['unknown'] += 1
         else:
             __rdt_stats['corrupt'] += 1
 
@@ -106,9 +123,9 @@ def rdt_recv() -> [tuple[bytes, tuple[str, int]], bytes]:
             __udt_send(send_pkt, address)
 
 
-def __make_pkt(data: bytes = b'', ack=False, nak=False) -> bytes:
-    flags = pack('!B', ack + (nak << 1))
-    checksum = pack('!H', __checksum(data))
+def __make_pkt(data: bytes = b'', seq_num=0b1111, ack=False, nak=False) -> bytes:
+    flags = pack('!B', (seq_num << 4) + ack + (nak << 1))
+    checksum = pack('!H', __checksum(flags + data))
 
     return checksum + flags + data
 
@@ -135,7 +152,7 @@ def __checksum(packet: bytes) -> int:
 
 def __corrupt(pkt: bytes) -> bool:
     expected_checksum = int.from_bytes(pkt[:2], 'big')
-    checksum = __checksum(pkt[3:])
+    checksum = __checksum(pkt[2:])
 
     return checksum != expected_checksum
 
@@ -146,6 +163,10 @@ def __is_ack(flags: int) -> bool:
 
 def __is_nak(flags: int) -> bool:
     return bool(flags & 0x02)
+
+
+def __has_seq(flags: int, seq_num: int) -> bool:
+    return (flags >> 4) == seq_num
 
 
 def rdt_stats(pprint=False):
@@ -164,13 +185,16 @@ def rdt_stats(pprint=False):
     if __rdt_stats['received'] > 0:
         print(f"  {__rdt_stats['safe']:6d} ({__rdt_stats['safe'] * recv_p:7.3f}%) safe packets")
         print(f"  {__rdt_stats['corrupt']:6d} ({__rdt_stats['corrupt'] * recv_p:7.3f}%) corrupt packets")
+        print(f"  {__rdt_stats['duplicated']:6d} ({__rdt_stats['duplicated'] * recv_p:7.3f}%) duplicated packets")
+        print(f"  {__rdt_stats['unknown']:6d} ({__rdt_stats['unknown'] * recv_p:7.3f}%) unknown packets")
 
     print(f"* Sent {__rdt_stats['sent']} packets")
 
     if __rdt_stats['sent'] > 0:
         print(f"  {__rdt_stats['ack']:6d} ({__rdt_stats['ack'] * sent_p:7.3f}%) ACK packets received")
         print(f"  {__rdt_stats['nak']:6d} ({__rdt_stats['nak'] * sent_p:7.3f}%) NAK packets received")
-        print(f"  {__rdt_stats['unknown']:6d} ({__rdt_stats['unknown'] * sent_p:7.3f}%) unknown packets received")
+        print(f"  {__rdt_stats['send_corrupt']:6d} ({__rdt_stats['send_corrupt'] * sent_p:7.3f}%) corrupt packets received")
+        print(f"  {__rdt_stats['send_unknown']:6d} ({__rdt_stats['send_unknown'] * sent_p:7.3f}%) unknown packets received")
 
     udt_p = (100 / __udt_stats['sent']) if __udt_stats['sent'] > 0 else 0
 
