@@ -1,18 +1,21 @@
 import errno
 import os
 import random
+import signal
 import socket
 import threading
+import time
 from struct import pack, unpack
 
 MAX_DATA_SIZE = 2 ** 15
 DELAY_RATE = 0.0
-LOSS_RATE = 0.0
+LOSS_RATE = 0.01
 CORRUPTION_RATE = 0.001
-DUPLICATION_RATE = 0.0
+DUPLICATION_RATE = 0.0001
 
 __rdt_stats = {
     'sent': 0,
+    'timeout': 0,
     'ack': 0,
     'duplicated_ack': 0,
     'send_corrupt': 0,
@@ -42,6 +45,8 @@ class __RDT:
     init = False
     send_seq_num = 0
     recv_seq_num = 0
+    estimated_rtt = 1.0
+    dev_rtt = 0
 
 
 def rdt_init(address: tuple[str, int], bind=False, simulate_unreliability=False) -> None:
@@ -67,26 +72,53 @@ def rdt_send(data: bytes, address: tuple[str, int] = None) -> int:
 
     send_pkt = __make_pkt(data, __RDT.send_seq_num)
 
+    timeout_interval = max(1e-3, __RDT.estimated_rtt + 4 * __RDT.dev_rtt)
+    has_timeout = False
+
     while True:
         size = __udt_send(send_pkt, address)
+        start = time.perf_counter_ns()
+
         __rdt_stats['sent'] += 1
 
-        recv_pkt, _ = __udt_recv()
-        _, flags = __extract(recv_pkt)
+        try:
+            __start_timer(timeout_interval)
 
-        if not __corrupt(recv_pkt):
-            if __is_ack(flags, __RDT.send_seq_num):
-                __rdt_stats['ack'] += 1
+            while True:
+                recv_pkt, _ = __udt_recv()
+                end = time.perf_counter_ns()
 
-                __RDT.send_seq_num ^= 1
+                _, flags = __extract(recv_pkt)
 
-                return size
-            elif __is_ack(flags, __RDT.send_seq_num ^ 1):
-                __rdt_stats['duplicated_ack'] += 1
-            else:  # shouldn't happen
-                __rdt_stats['send_unknown'] += 1
+                if not __corrupt(recv_pkt):
+                    if __is_ack(flags, __RDT.send_seq_num):
+                        break
+                    elif __is_ack(flags, __RDT.send_seq_num ^ 1):
+                        __rdt_stats['duplicated_ack'] += 1
+                    else:  # shouldn't happen
+                        __rdt_stats['send_unknown'] += 1
+                else:
+                    __rdt_stats['send_corrupt'] += 1
+
+            __stop_timer()
+        except TimeoutError:
+            __rdt_stats['timeout'] += 1
+
+            timeout_interval *= 2
+            has_timeout = True
         else:
-            __rdt_stats['send_corrupt'] += 1
+            __rdt_stats['ack'] += 1
+
+            __RDT.send_seq_num ^= 1
+
+            if not has_timeout:
+                sample_rtt = (end - start) / 1e9
+                __RDT.dev_rtt = 0.75 * __RDT.dev_rtt + 0.25 * abs(__RDT.estimated_rtt - sample_rtt)
+                __RDT.estimated_rtt = 0.875 * __RDT.estimated_rtt + 0.125 * sample_rtt
+
+            return size
+        finally:
+            __stop_timer()
 
 
 def rdt_recv() -> [tuple[bytes, tuple[str, int]], bytes]:
@@ -165,6 +197,16 @@ def __has_seq(flags: int, seq_num: int) -> bool:
     return (flags >> 4) == seq_num
 
 
+def __start_timer(timeout):
+    signal.signal(signal.SIGALRM, lambda _, __: (_ for _ in ()).throw(TimeoutError()))
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+
+
+def __stop_timer():
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, signal.SIG_IGN)
+
+
 def rdt_stats(pprint=False):
     if not pprint:
         return {
@@ -191,6 +233,7 @@ def rdt_stats(pprint=False):
         print(f"  {__rdt_stats['duplicated_ack']:6d} ({__rdt_stats['duplicated_ack'] * sent_p:7.3f}%) duplicated ACK packets received")
         print(f"  {__rdt_stats['send_corrupt']:6d} ({__rdt_stats['send_corrupt'] * sent_p:7.3f}%) corrupt packets received")
         print(f"  {__rdt_stats['send_unknown']:6d} ({__rdt_stats['send_unknown'] * sent_p:7.3f}%) unknown packets received")
+        print(f"  {__rdt_stats['timeout']:6d} timeout events")
 
     udt_p = (100 / __udt_stats['sent']) if __udt_stats['sent'] > 0 else 0
 
